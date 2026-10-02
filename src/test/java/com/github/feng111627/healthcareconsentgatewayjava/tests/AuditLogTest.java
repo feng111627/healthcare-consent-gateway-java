@@ -73,7 +73,8 @@ class AuditLogTest {
         AuditRecord forged = new AuditRecord(second.sequence(), second.timestamp(),
                 second.requesterId(), second.patientId(), second.purpose(),
                 "ALLOWED", second.reason(), second.ruleVersion(),
-                second.maskingPolicyVersion(), second.prevHash(), second.hash());
+                second.maskingPolicyVersion(), second.deniedSections(),
+                second.resultHash(), second.prevHash(), second.hash());
         replaceRecord(auditLog, 1, forged);
 
         long tamperedAt = auditLog.verify();
