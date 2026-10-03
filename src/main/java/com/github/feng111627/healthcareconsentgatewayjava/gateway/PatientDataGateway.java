@@ -26,6 +26,9 @@ import java.util.Optional;
 @Service
 public class PatientDataGateway {
 
+    /** 脱敏失败时写入响应与审计的统一原因（重放复现失败场景时使用同一文本）。 */
+    public static final String MASKING_FAILURE_REASON = "masking failed, data withheld";
+
     private final ConsentEvaluator consentEvaluator;
     private final MaskingService maskingService;
     private final AuditLog auditLog;
@@ -68,7 +71,7 @@ public class PatientDataGateway {
         } catch (MaskingException e) {
             // 脱敏出错：返回错误并留痕，不带任何原始数据
             DecisionResult failure = new DecisionResult(Decision.ERROR_MASKING_FAILED,
-                    "masking failed, data withheld", result.ruleVersion(),
+                    MASKING_FAILURE_REASON, result.ruleVersion(),
                     null, result.consentSnapshot());
             audit(request, failure, policy, null);
             return new GatewayResponse(failure.decision(), failure.reason(), null);

@@ -6,7 +6,13 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
-/** 一条患者授权记录（内存模拟）。scopes 为授权开放的数据维度，空集表示未授予任何维度。 */
+/**
+ * 一条患者授权记录（内存模拟）。
+ * scopes 为授权开放的数据维度，三种语义明确区分：
+ * - null：未写维度的旧授权（升级前创建），按全量访问处理；
+ * - 空集：明确授予了「零个维度」，等同于整体拒绝（DENIED_NO_SCOPE）；
+ * - 非空集：按「部分可见」判定。
+ */
 public class Consent {
     private final String consentId;
     private final String patientId;
@@ -16,10 +22,10 @@ public class Consent {
     private final Instant expiresAt;
     private final Instant revokedAt;
 
-    /** 兼容旧用法：不携带数据维度授权。 */
+    /** 兼容旧用法：不携带数据维度授权（scopes=null，升级后仍按全量访问处理）。 */
     public Consent(String consentId, String patientId, String requesterId,
                    Set<Purpose> purposes, Instant expiresAt, Instant revokedAt) {
-        this(consentId, patientId, requesterId, purposes, Set.of(), expiresAt, revokedAt);
+        this(consentId, patientId, requesterId, purposes, null, expiresAt, revokedAt);
     }
 
     public Consent(String consentId, String patientId, String requesterId,
@@ -38,6 +44,8 @@ public class Consent {
     public String getPatientId() { return patientId; }
     public String getRequesterId() { return requesterId; }
     public Set<Purpose> getPurposes() { return purposes; }
+
+    /** 授权的数据维度；null 表示未写维度的旧授权（全量访问），空集表示明确未授予任何维度。 */
     public Set<String> getScopes() { return scopes; }
     public Instant getExpiresAt() { return expiresAt; }
     public Instant getRevokedAt() { return revokedAt; }
@@ -51,11 +59,14 @@ public class Consent {
     /**
      * 规范化快照：包含判定所需的全部输入，字段排序保证确定性。
      * 快照写入审计记录，重放时据此还原判定输入，与当前授权库状态无关。
+     * scopes 编码：null（旧授权）-> "null"；空集 -> 空串；非空 -> 逗号分隔，
+     * 三种形态在快照中可区分、可还原。
      */
     public String toSnapshot() {
         String purposesPart = purposes.stream().map(Enum::name).sorted()
                 .collect(Collectors.joining(","));
-        String scopesPart = scopes.stream().sorted().collect(Collectors.joining(","));
+        String scopesPart = scopes == null ? "null"
+                : scopes.stream().sorted().collect(Collectors.joining(","));
         return String.join(";",
                 "consentId=" + consentId,
                 "patientId=" + patientId,
@@ -73,7 +84,7 @@ public class Consent {
         }
         String consentId = null, patientId = null, requesterId = null;
         Set<Purpose> purposes = new TreeSet<>();
-        Set<String> scopes = new TreeSet<>();
+        Set<String> scopes = null;
         Instant expiresAt = null, revokedAt = null;
         for (String part : snapshot.split(";")) {
             int idx = part.indexOf('=');
@@ -89,8 +100,12 @@ public class Consent {
                     }
                 }
                 case "scopes" -> {
-                    if (!value.isEmpty()) {
-                        scopes.addAll(Arrays.asList(value.split(",")));
+                    if (!value.equals("null")) {
+                        // 空串 = 明确授予零个维度；否则按逗号分隔还原
+                        scopes = new TreeSet<>();
+                        if (!value.isEmpty()) {
+                            scopes.addAll(Arrays.asList(value.split(",")));
+                        }
                     }
                 }
                 case "expiresAt" -> expiresAt = value.equals("null") ? null : Instant.parse(value);

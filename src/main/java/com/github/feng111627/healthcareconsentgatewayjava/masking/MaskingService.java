@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - 支持嵌套 Map / List，拼接响应中的任何命中字段都不会漏出原文；
  * - 拼接字段（composite）：成分字段先各自按策略脱敏，脱敏结果再组合，
  *   任何一层（顶层/嵌套对象/列表元素）的拼接输出都不含成分原文；
+ *   成分缺位、成分未配置策略、或成分值不是简单文本时，该拼接字段整体不输出；
  * - 策略来自配置 gateway.masking.fields.<field>=FULL|PARTIAL|HASH，
  *   拼接字段来自 gateway.masking.composites.<output>=c1,c2（可选 .separator）；
  * - 历史策略版本保留在注册表中，新版本只增不改，审计复现时可按版本取回。
@@ -149,14 +150,14 @@ public class MaskingService {
     }
 
     /**
-     * 在当前（已脱敏的）Map 节点上计算拼接字段：
-     * 所有成分都在场时才生成，成分缺位则跳过，绝不输出未脱敏的组合。
+     * 在当前（已脱敏的）Map 节点上计算拼接字段。
+     * 严格失败安全：任一成分缺位、未配置脱敏策略、或脱敏结果不是简单文本
+     * （如嵌套对象/列表），都跳过该拼接字段、整体不输出——
+     * 宁可少一个展示字段，也绝不让成分原文被拼进结果带出去。
      */
     private void applyComposites(Map<String, Object> maskedNode, MaskingPolicy policy) {
         for (CompositeField composite : policy.getComposites()) {
-            boolean allPresent = composite.components().stream()
-                    .allMatch(c -> maskedNode.get(c) != null);
-            if (!allPresent) {
+            if (!canCompose(maskedNode, policy, composite)) {
                 continue;
             }
             StringBuilder composed = new StringBuilder();
@@ -168,6 +169,27 @@ public class MaskingService {
             }
             maskedNode.put(composite.outputField(), composed.toString());
         }
+    }
+
+    /**
+     * 拼接字段是否可安全输出：所有成分都在场、都配置了脱敏策略、
+     * 且脱敏后的值是简单文本（String）。任一不满足则不可输出。
+     */
+    private boolean canCompose(Map<String, Object> maskedNode, MaskingPolicy policy,
+                               CompositeField composite) {
+        for (String component : composite.components()) {
+            Object maskedValue = maskedNode.get(component);
+            if (maskedValue == null) {
+                return false; // 成分缺位
+            }
+            if (policy.getFieldStrategies().get(component) == null) {
+                return false; // 成分没有对应处理规则，脱敏后的值不可信（可能是原文）
+            }
+            if (!(maskedValue instanceof String)) {
+                return false; // 成分不是简单的一段文本（嵌套对象/列表等），无法安全拼接
+            }
+        }
+        return true;
     }
 
     private String applyStrategy(String value, MaskingPolicy.Strategy strategy) {

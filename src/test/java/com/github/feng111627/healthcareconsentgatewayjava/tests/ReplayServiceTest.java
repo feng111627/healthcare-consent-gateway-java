@@ -13,6 +13,7 @@ import com.github.feng111627.healthcareconsentgatewayjava.gateway.AccessRequest;
 import com.github.feng111627.healthcareconsentgatewayjava.gateway.GatewayResponse;
 import com.github.feng111627.healthcareconsentgatewayjava.gateway.PatientDataGateway;
 import com.github.feng111627.healthcareconsentgatewayjava.gateway.PatientRecordStore;
+import com.github.feng111627.healthcareconsentgatewayjava.masking.MaskingException;
 import com.github.feng111627.healthcareconsentgatewayjava.masking.MaskingPolicy;
 import com.github.feng111627.healthcareconsentgatewayjava.masking.MaskingService;
 import com.github.feng111627.healthcareconsentgatewayjava.replay.ReplayResult;
@@ -35,6 +36,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -63,7 +65,7 @@ class ReplayServiceTest {
         maskingService = new MaskingService(new MockEnvironment());
         auditLog = new AuditLog();
         recordStore = new PatientRecordStore();
-        replayService = new ReplayService(auditLog, ruleRegistry, maskingService);
+        replayService = new ReplayService(auditLog, ruleRegistry, maskingService, recordStore);
     }
 
     private PatientDataGateway gatewayAt(String ruleVersion) {
@@ -109,7 +111,7 @@ class ReplayServiceTest {
         assertEquals("ALLOWED", replayV1.replayedDecision());
         assertNotEquals(replayV1.replayedDecision(), v2Response.decision().name());
         // 当时返回的脱敏结果原样复现
-        assertEquals(CanonicalPayload.of(v1Response.data()), replayV1.maskedPayload());
+        assertEquals(CanonicalPayload.of(v1Response.data()), replayV1.replayedMaskedPayload());
 
         // 重放 v2 时代的记录：各自的结论各自复现，互不影响
         ReplayResult replayV2 = replayService.replay(v2Seq);
@@ -143,8 +145,8 @@ class ReplayServiceTest {
         assertTrue(replay.consistent());
         assertEquals("masking-v1", replay.record().maskingPolicyVersion());
         // 脱敏结果与当时返回完全一致，不受 masking-v2 影响
-        assertEquals(payloadAtAccess, replay.maskedPayload());
-        assertEquals(CanonicalPayload.of(response.data()), replay.maskedPayload());
+        assertEquals(payloadAtAccess, replay.replayedMaskedPayload());
+        assertEquals(CanonicalPayload.of(response.data()), replay.replayedMaskedPayload());
         assertEquals(-1, auditLog.verify());
     }
 
@@ -163,8 +165,8 @@ class ReplayServiceTest {
         assertTrue(replay.consistent());
         assertEquals("ALLOWED_PARTIAL", replay.replayedDecision());
         // 当时返回的内容里未授权维度确实被扣留
-        assertTrue(replay.maskedPayload().contains("[UNAUTHORIZED]"));
-        assertEquals(CanonicalPayload.of(response.data()), replay.maskedPayload());
+        assertTrue(replay.replayedMaskedPayload().contains("[UNAUTHORIZED]"));
+        assertEquals(CanonicalPayload.of(response.data()), replay.replayedMaskedPayload());
     }
 
     @Test
@@ -180,6 +182,68 @@ class ReplayServiceTest {
         assertEquals("DENIED_NO_CONSENT", replay.replayedDecision());
     }
 
+
+    @Test
+    void replayRecomputesPayloadAndDetectsDataDrift() {
+        // 重放不是把记录里留存的内容原样取出：访问后患者数据被改动，
+        // 重放按当时策略重算出的脱敏结果会与记录留存内容对不上，一致性校验必须能发现
+        consentRepository.save(new Consent("C5", "P001", "doctor-A",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null));
+        GatewayResponse response = gatewayAt("consent-rules-v1")
+                .access(new AccessRequest("doctor-A", "P001", Purpose.TREATMENT));
+        long seq = auditLog.records().size() - 1;
+
+        // 改动患者数据（姓名成分变化 -> 同样策略下重算结果必然不同）
+        var record = new java.util.HashMap<>(recordStore.findById("P001").orElseThrow());
+        record.put("name", "王芳");
+        recordStore.save("P001", record);
+        log.info("输入: 访问产生记录 seq={} 后, 患者姓名被改为 王芳, 再重放", seq);
+
+        ReplayResult replay = replayService.replay(seq);
+        log.info("判定依据: 重算payload={}, 记录留存payload={}",
+                replay.replayedMaskedPayload(), replay.recordedMaskedPayload());
+
+        // 重算结果与留存内容对不上 -> 判定为不一致
+        assertFalse(replay.consistent());
+        assertNotEquals(replay.replayedMaskedPayload(), replay.recordedMaskedPayload());
+        // 留存内容仍受哈希链保护、可取出核对（是当时返回的真实内容）
+        assertEquals(CanonicalPayload.of(response.data()), replay.recordedMaskedPayload());
+        // 记录本身未被篡改，不一致来自数据变化而非记录损坏
+        assertEquals(-1, auditLog.verify());
+    }
+
+    @Test
+    void maskingFailureRecordReplaysByReproducingTheFailure() {
+        // 当时脱敏失败的记录：重放时用同一版本策略真实重现失败过程，
+        // 而不是把当时的 ERROR 结论照抄出来
+        MaskingService broken = new MaskingService(new MockEnvironment()) {
+            @Override
+            public Map<String, Object> mask(Map<String, Object> data, MaskingPolicy policy) {
+                throw new MaskingException("simulated failure", null);
+            }
+        };
+        PatientDataGateway brokenGateway = new PatientDataGateway(
+                new ConsentEvaluator(consentRepository, ruleRegistry, "consent-rules-v1"),
+                broken, auditLog, recordStore);
+        ReplayService brokenReplay = new ReplayService(auditLog, ruleRegistry, broken, recordStore);
+        consentRepository.save(new Consent("C6", "P001", "doctor-A",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null));
+
+        GatewayResponse response = brokenGateway.access(
+                new AccessRequest("doctor-A", "P001", Purpose.TREATMENT));
+        assertEquals(Decision.ERROR_MASKING_FAILED, response.decision());
+        long seq = auditLog.records().size() - 1;
+        log.info("输入: 脱敏服务故障下访问产生 ERROR 记录 seq={}, 随后重放", seq);
+
+        ReplayResult replay = brokenReplay.replay(seq);
+        logReplay(seq, replay);
+
+        // 重放真实重现了脱敏失败：结论、原因、空结果都与当时一致
+        assertTrue(replay.consistent());
+        assertEquals("ERROR_MASKING_FAILED", replay.replayedDecision());
+        assertEquals(null, replay.replayedMaskedPayload());
+        assertEquals(null, replay.recordedMaskedPayload());
+    }
     @Test
     void replayStaysConsistentUnderConcurrentAccessAndGrowth() throws InterruptedException {
         consentRepository.save(new Consent("C4", "P001", "doctor-A",

@@ -8,9 +8,10 @@ import java.util.TreeSet;
 
 /**
  * v2 规则：在 v1 的整体判定之上，支持数据维度（scope）级授权。
- * - 授权覆盖全部维度      -> ALLOWED（返回全部）；
- * - 只覆盖部分维度        -> ALLOWED_PARTIAL（授权部分返回，未授权部分扣留）；
- * - 一个维度都没授予      -> DENIED_NO_SCOPE（整体拒绝，与 ALLOWED_PARTIAL 明确区分）。
+ * - 未写维度的旧授权（scopes=null）-> ALLOWED，按升级前的全量访问处理（兼容行为）；
+ * - 授权覆盖全部维度               -> ALLOWED（返回全部）；
+ * - 只覆盖部分维度                 -> ALLOWED_PARTIAL（授权部分返回，未授权部分扣留）；
+ * - 明确授予零个维度（空集）       -> DENIED_NO_SCOPE（整体拒绝，与 ALLOWED_PARTIAL 明确区分）。
  * 字段 -> 维度映射随规则版本固化，重放旧记录时不受后续版本调整影响。
  */
 public class ConsentRuleV2 implements ConsentRule {
@@ -56,9 +57,16 @@ public class ConsentRuleV2 implements ConsentRule {
                     VERSION, null, baseResult.consentSnapshot());
         }
         // 在整体允许的基础上做维度判定
+        String snapshot = consent.toSnapshot();
+        if (consent.getScopes() == null) {
+            // 未写数据维度的旧授权：保持升级前的全量访问行为，grantedScopes=null 表示不过滤
+            return new DecisionResult(Decision.ALLOWED,
+                    "consent " + consent.getConsentId() + " covers purpose " + purpose
+                            + " (legacy consent without scopes, full access)",
+                    VERSION, null, snapshot);
+        }
         Set<String> granted = new TreeSet<>(consent.getScopes());
         granted.retainAll(KNOWN_SCOPES);
-        String snapshot = consent.toSnapshot();
         if (granted.isEmpty()) {
             return new DecisionResult(Decision.DENIED_NO_SCOPE,
                     "consent " + consent.getConsentId() + " grants no data scope (granted: "

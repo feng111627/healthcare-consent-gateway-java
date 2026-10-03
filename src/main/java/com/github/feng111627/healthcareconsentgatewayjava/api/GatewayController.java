@@ -56,11 +56,11 @@ public class GatewayController {
         return ResponseEntity.ok(response);
     }
 
-    /** 登记授权（本地模拟）。scopes 为授权开放的数据维度，可空。 */
+    /** 登记授权（本地模拟）。scopes 为授权开放的数据维度；缺省（null）表示未写维度的旧授权，按全量访问处理。 */
     @PostMapping("/consents")
     public ResponseEntity<Map<String, String>> createConsent(@RequestBody ConsentDto dto) {
         consentRepository.save(new Consent(dto.consentId(), dto.patientId(), dto.requesterId(),
-                dto.purposes(), dto.scopes() == null ? Set.of() : dto.scopes(),
+                dto.purposes(), dto.scopes(),
                 dto.expiresAt(), dto.revokedAt()));
         return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("consentId", dto.consentId()));
     }
