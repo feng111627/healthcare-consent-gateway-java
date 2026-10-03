@@ -1,5 +1,6 @@
 package com.github.feng111627.healthcareconsentgatewayjava.tests;
 
+import com.github.feng111627.healthcareconsentgatewayjava.masking.CompositeField;
 import com.github.feng111627.healthcareconsentgatewayjava.masking.MaskingPolicy;
 import com.github.feng111627.healthcareconsentgatewayjava.masking.MaskingService;
 import org.junit.jupiter.api.BeforeEach;
@@ -141,5 +142,94 @@ class CompositeMaskingTest {
         assertFalse(masked.containsKey("fullName"));
         assertTrue(String.valueOf(masked.get("contactPhone")).startsWith("0***0-sha256:"));
         assertFalse(masked.toString().contains("欧阳"));
+    }
+
+    /** 成分没配到处理规则的策略：firstName 无规则，fullName=lastName,firstName。 */
+    private MaskingPolicy policyWithoutFirstNameRule() {
+        return new MaskingPolicy("test-no-firstname-rule",
+                Map.of("lastName", MaskingPolicy.Strategy.PARTIAL),
+                List.of(new CompositeField("fullName", List.of("lastName", "firstName"), "")));
+    }
+
+    @Test
+    void componentWithoutRuleSkipsCompositeAtTopLevel() {
+        MaskingPolicy policy = policyWithoutFirstNameRule();
+        Map<String, Object> input = Map.of("lastName", "欧阳", "firstName", "娜娜");
+        Map<String, Object> masked = maskingService.mask(input, policy);
+        log.info("输入(顶层成分 firstName 无规则): {}", input);
+        log.info("判定依据: strategies={}, composites={}", policy.getFieldStrategies(), policy.getComposites());
+        log.info("输出: {}", masked);
+
+        // firstName 没配规则 -> 拼接字段整体不输出，绝不能把未脱敏的「娜娜」拼进结果
+        assertFalse(masked.containsKey("fullName"), "成分无规则时不得输出拼接字段");
+        Object fullName = masked.get("fullName");
+        assertFalse(fullName != null && String.valueOf(fullName).contains("娜娜"), "拼接值泄露成分原文");
+    }
+
+    @Test
+    void nonTextComponentSkipsCompositeAtTopLevel() {
+        // firstName 配了规则，但它的值不是简单文本（结构化对象）
+        Map<String, Object> input = Map.of(
+                "lastName", "欧阳",
+                "firstName", Map.of("given", "娜娜"));
+        Map<String, Object> masked = maskingService.mask(input, maskingService.currentPolicy());
+        log.info("输入(顶层成分 firstName 为对象): {}", input);
+        log.info("输出: {}", masked);
+
+        assertFalse(masked.containsKey("fullName"), "成分不是简单文本时不得输出拼接字段");
+        // 拼接字段不存在，结构化内容不会被 toString 拼进任何字符串值
+        for (Object value : masked.values()) {
+            if (value instanceof CharSequence) {
+                assertFalse(value.toString().contains("娜娜"), "字符串值泄露成分原文: " + value);
+            }
+        }
+    }
+
+    @Test
+    void unprocessableComponentSkipsCompositeInNestedObject() {
+        MaskingPolicy policy = policyWithoutFirstNameRule();
+        Map<String, Object> input = Map.of(
+                "emergencyContact", Map.of("lastName", "张", "firstName", "伟"),
+                "legalGuardian", Map.of("lastName", "李", "firstName", Map.of("given", "四")));
+        Map<String, Object> masked = maskingService.mask(input, maskingService.currentPolicy());
+        // 嵌套对象里：firstName 无规则（用无规则策略重算一次）
+        Map<String, Object> maskedNoRule = maskingService.mask(input, policy);
+        log.info("输入(嵌套对象成分无规则/非文本): {}", input);
+        log.info("输出(无规则策略): {}", maskedNoRule);
+        log.info("输出(非文本成分): {}", masked);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> contact = (Map<String, Object>) maskedNoRule.get("emergencyContact");
+        assertFalse(contact.containsKey("fullName"), "嵌套对象中成分无规则时不得输出拼接字段");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> guardian = (Map<String, Object>) masked.get("legalGuardian");
+        assertFalse(guardian.containsKey("fullName"), "嵌套对象中成分非文本时不得输出拼接字段");
+    }
+
+    @Test
+    void unprocessableComponentSkipsCompositeInListElements() {
+        MaskingPolicy policy = policyWithoutFirstNameRule();
+        Map<String, Object> input = Map.of("visits", List.of(
+                Map.of("doctor", Map.of("lastName", "李", "firstName", "四")),
+                Map.of("doctor", Map.of("lastName", "王", "firstName", Map.of("given", "五")))));
+        Map<String, Object> maskedNoRule = maskingService.mask(input, policy);
+        Map<String, Object> maskedNonText = maskingService.mask(input, maskingService.currentPolicy());
+        log.info("输入(列表元素成分无规则/非文本): {}", input);
+        log.info("输出(无规则策略): {}", maskedNoRule);
+        log.info("输出(非文本成分): {}", maskedNonText);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> visitsNoRule = (List<Map<String, Object>>) maskedNoRule.get("visits");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> doctor0 = (Map<String, Object>) visitsNoRule.get(0).get("doctor");
+        assertFalse(doctor0.containsKey("fullName"), "列表元素中成分无规则时不得输出拼接字段");
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> visitsNonText = (List<Map<String, Object>>) maskedNonText.get("visits");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> doctor1 = (Map<String, Object>) visitsNonText.get(1).get("doctor");
+        assertFalse(doctor1.containsKey("fullName"), "列表元素中成分非文本时不得输出拼接字段");
+        // 无规则策略下两个列表元素都不得生成拼接字段（序列化输出中不存在 fullName）
+        assertFalse(maskedNoRule.toString().contains("fullName"));
     }
 }

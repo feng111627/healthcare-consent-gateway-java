@@ -55,6 +55,14 @@ public class ConsentRuleV2 implements ConsentRule {
             return new DecisionResult(baseResult.decision(), baseResult.reason(),
                     VERSION, null, baseResult.consentSnapshot());
         }
+        // 兼容性：未写明数据维度的旧授权按全量访问处理（grantedScopes=null 不过滤），
+        // 只有确实列了维度（含空集）的授权才走「部分可见」判定
+        if (!consent.hasScopeRestriction()) {
+            return new DecisionResult(Decision.ALLOWED,
+                    "consent " + consent.getConsentId() + " covers purpose " + purpose
+                            + " (legacy consent without scopes, full access)",
+                    VERSION, null, consent.toSnapshot());
+        }
         // 在整体允许的基础上做维度判定
         Set<String> granted = new TreeSet<>(consent.getScopes());
         granted.retainAll(KNOWN_SCOPES);

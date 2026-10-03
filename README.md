@@ -42,7 +42,10 @@ replay/ReplayService         历史复现：按记录中的版本重放判定结
 
 ### 范围授权（部分可见，v2 起）
 
-授权记录可携带 `scopes`（数据维度集合）。v2 规则内置「字段 -> 维度」映射
+授权记录可携带 `scopes`（数据维度集合）。**兼容性约定**：`scopes` 不填（旧授权）
+表示未写明维度，升级后仍按原来的**全量访问**处理、不做维度过滤；只有确实列了
+维度（含空集）的授权才走下面的「部分可见」判定——升级不会把原来能读的请求变成拒绝。
+v2 规则内置「字段 -> 维度」映射
 （随规则版本固化，见 `ConsentRuleV2.FIELD_SCOPES`）：
 
 | 维度 | 字段 |
@@ -97,7 +100,12 @@ gateway.masking.composites.fullAddress=province,city,street
 2. 在**任意层级**生效：顶层字段、嵌套对象（如 `emergencyContact`）、
    列表元素（如 `visits[].doctor`）中的成分都会先脱敏再组合；
 3. 成分不全时**跳过该拼接字段**，不会输出拼了一半的原文；
-4. 拼接定义随策略版本固化，历史记录重放时按当时版本的定义复现。
+4. **成分处理不了时同样跳过整个拼接字段**（宁可不输出，也绝不让原文进入组合值）：
+   - 某个成分没配到处理规则（策略里没有该字段）——未脱敏的原文绝不拼进结果；
+   - 某个成分的值不是简单的一段文本（如对象是 Map/List）——结构化内容不会被
+     toString 拼进结果带出原文；
+   - 以上约束在顶层字段、嵌套对象、列表元素中同样严格；
+5. 拼接定义随策略版本固化，历史记录重放时按当时版本的定义复现。
 
 ## 审计留痕（看没看过）
 
@@ -114,9 +122,11 @@ sequence | timestamp | requesterId | patientId | purpose | decision | reason
 - **并发安全**：追加在锁内完成，并发写入不会破坏链的连续性（序号无空洞、prevHash 链接不断）；
 - **校验方式**：`AuditLog.verify()` 重放整条链，返回第一条被篡改记录的序号（全部合法返回 `-1`）；
   `AuditLog.verifyRecord(seq)` 校验单条记录（自身哈希 + 与前序的链接）；
-- **自包含**：`consentSnapshot` 保存判定所依据的授权快照（规范化字符串），
+- **自包含**：`consentSnapshot` 保存判定所依据的授权快照（规范化字符串，
+  未写维度的旧授权记为 `scopes=*`，与空维度集明确区分），
   `maskedPayload` 保存当时实际返回的脱敏结果（已脱敏，可安全留痕），
-  两者都受哈希链保护——重放不依赖当前授权库与当前数据状态。
+  两者都受哈希链保护——重放判定结论不依赖当前授权库状态；
+  重放脱敏结果时会对当前数据按当时策略重算并与留存值核对，对不上会明确标出。
 
 ## 历史复现（重放）
 
@@ -126,8 +136,12 @@ sequence | timestamp | requesterId | patientId | purpose | decision | reason
 1. 先 `verifyRecord` 确认该记录未被篡改；
 2. 按记录中的 `ruleVersion` 从注册表取回**当时版本**的规则引擎，
    用记录中的授权快照 + 记录时间戳**重算判定结论**（允许/拒绝及具体类别），与记录比对；
-3. 当时返回的脱敏结果（`maskedPayload`）原样取出返回；
-4. `consistent=true` 表示重算结论与记录完全一致。
+3. 按记录中的 `maskingPolicyVersion` 取回**当时版本**的脱敏策略，
+   对患者数据**重新脱敏 + 范围裁剪**，重新得出脱敏结果——不是把记录里留存的
+   `maskedPayload` 原样拿出来当结果；
+4. 重算出的脱敏结果与记录留存的 `maskedPayload` 核对（`payloadMatches`），
+   对不上（如数据已变化、无法复现）会被明确标出；
+5. `consistent=true` 表示 记录哈希完好 且 重算结论与记录一致 且 脱敏结果核对一致。
 
 **边界与保证**：
 
@@ -138,6 +152,9 @@ sequence | timestamp | requesterId | patientId | purpose | decision | reason
 - 新老记录共存于同一条哈希链，校验与重放互不影响；
 - 重放不读取当前授权库：判定输入全部来自记录中的快照，授权后续变更不影响重放；
 - 重放判定使用的是**记录时间戳**，授权过期判定与当时一致；
+- 重放脱敏结果使用**记录中的策略版本**重算：新版本策略发布后，旧记录重放仍按旧策略
+  得出结果；若数据已变化导致重算结果与记录留存内容对不上，`payloadMatches=false`
+  且 `consistent=false`，不会被静默当成一致；
 - `ERROR_MASKING_FAILED` 是运行时事件：重放时验证的是「当时的授权判定确实走到了允许」，
   失败结果本身以记录为准；
 - 记录持续增长与并发访问下，重放与校验同样稳定（有并发用例覆盖）；
@@ -156,11 +173,15 @@ mvn test
 - `ConsentEvaluatorTest`：授权撤回 / 过期 / 越权 / 无授权 / 撤回优先于过期；
 - `MaskingServiceTest`：嵌套结构递归脱敏、拼接输出无原文泄露、脱敏失败抛异常、历史策略版本复现；
 - `CompositeMaskingTest`：拼接字段成分各自脱敏后再组合、嵌套/列表中的拼接、
-  组合值与序列化输出无成分原文、成分缺失时跳过；
+  组合值与序列化输出无成分原文、成分缺失时跳过、**成分缺规则或成分值不是简单文本时
+  整个拼接字段不输出**（顶层 / 嵌套对象 / 列表元素各有用例，均不泄露原文）；
 - `ScopedAccessTest`：部分维度授权时只返回授权部分、未授权部分 `[UNAUTHORIZED]` 扣留、
-  `ALLOWED_PARTIAL` 与 `DENIED_*` 在响应与审计中可区分、零维度授权整体拒绝；
-- `ReplayServiceTest`：发布新规则/策略版本后旧记录重放结论与当时一致、新老记录共存、
-  并发访问与记录增长下重放与校验稳定；
+  `ALLOWED_PARTIAL` 与 `DENIED_*` 在响应与审计中可区分、零维度授权整体拒绝、
+  **未写维度的旧授权升级后仍全量访问**（显式空集才判 `DENIED_NO_SCOPE`）、
+  旧授权快照可无损还原（`scopes=*` 与空集可区分）；
+- `ReplayServiceTest`：发布新规则/策略版本后旧记录重放结论与当时一致、
+  **脱敏结果按当时策略版本重算并与记录核对**（数据变化导致对不上时
+  `payloadMatches=false`）、新老记录共存、并发访问与记录增长下重放与校验稳定；
 - `AuditLogTest`：16 线程并发写入后链仍可校验、篡改记录被定位、完整链校验为 -1；
 - `PatientDataGatewayTest`：端到端拒绝原因可区分、允许时返回脱敏数据、脱敏失败不泄露。
 
@@ -191,11 +212,19 @@ curl 'localhost:8080/api/patients/P001?requesterId=analyst-B&purpose=RESEARCH'
 curl 'localhost:8080/api/patients/P001?requesterId=doctor-A&purpose=MARKETING'
 curl 'localhost:8080/api/patients/P001?requesterId=stranger&purpose=TREATMENT'
 
+# 4b. 旧式授权（不写 scopes 字段）升级后仍全量访问，不会被误判为零维度拒绝
+curl -X POST localhost:8080/api/consents -H 'Content-Type: application/json' -d '{
+  "consentId":"C3","patientId":"P001","requesterId":"doctor-legacy",
+  "purposes":["TREATMENT"],
+  "expiresAt":"2026-10-31T00:00:00Z","revokedAt":null}'
+curl 'localhost:8080/api/patients/P001?requesterId=doctor-legacy&purpose=TREATMENT'
+
 # 5. 查看审计链与校验结果（intact=true 表示未被篡改）
 curl localhost:8080/api/audit
 curl localhost:8080/api/audit/verify
 
-# 6. 历史复现：重放第 0 条记录，consistent=true 表示与当时结论一致
+# 6. 历史复现：重放第 0 条记录；maskedPayload 是按当时策略版本重算的结果，
+#    payloadMatches=true 且 consistent=true 表示与当时记录核对一致
 curl localhost:8080/api/audit/0/replay
 ```
 

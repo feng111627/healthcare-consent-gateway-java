@@ -149,14 +149,20 @@ public class MaskingService {
     }
 
     /**
-     * 在当前（已脱敏的）Map 节点上计算拼接字段：
-     * 所有成分都在场时才生成，成分缺位则跳过，绝不输出未脱敏的组合。
+     * 在当前（已脱敏的）Map 节点上计算拼接字段。
+     * 安全约束（宁可不输出，也绝不让原文进入组合值）：
+     * - 成分缺位 -> 跳过该拼接字段；
+     * - 成分没配到处理规则（策略里没有该字段）-> 跳过，未脱敏的原文绝不拼进结果；
+     * - 成分脱敏后不是简单文本（如该字段的值是对象/列表）-> 跳过，
+     *   避免把结构化内容的 toString 拼进结果带出原文。
      */
     private void applyComposites(Map<String, Object> maskedNode, MaskingPolicy policy) {
         for (CompositeField composite : policy.getComposites()) {
-            boolean allPresent = composite.components().stream()
-                    .allMatch(c -> maskedNode.get(c) != null);
-            if (!allPresent) {
+            boolean composable = composite.components().stream().allMatch(c ->
+                    maskedNode.get(c) != null
+                            && policy.getFieldStrategies().containsKey(c)
+                            && maskedNode.get(c) instanceof CharSequence);
+            if (!composable) {
                 continue;
             }
             StringBuilder composed = new StringBuilder();

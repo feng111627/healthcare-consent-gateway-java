@@ -161,6 +161,68 @@ class ScopedAccessTest {
         assertEquals(-1, auditLog.verify());
     }
 
+    @Test
+    void legacyConsentWithoutScopesKeepsFullAccessAfterUpgrade() {
+        // 升级前的旧授权：根本没写数据维度（6 参构造，scopes=null）
+        consentRepository.save(new Consent("C5", "P001", "doctor-legacy",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null));
+
+        GatewayResponse response = accessAndLog("doctor-legacy", "P001", Purpose.TREATMENT);
+
+        // v2 规则下仍按原来的全量访问处理，不被误判成「零维度」拒绝
+        assertEquals(Decision.ALLOWED, response.decision());
+        String serialized = String.valueOf(response.data());
+        log.info("输出: {}", serialized);
+        assertFalse(serialized.contains(ScopeFilter.UNAUTHORIZED), "旧授权不应触发维度扣留");
+        assertEquals("张*", response.data().get("name"));
+        assertTrue(serialized.contains("fullName"), "全量访问应包含拼接字段");
+        assertEquals("ALLOWED",
+                auditLog.records().get(auditLog.records().size() - 1).decision());
+    }
+
+    @Test
+    void explicitNullScopesBehavesLikeLegacyConsent() {
+        // 7 参构造显式传 null：与旧授权同义（全量访问）
+        consentRepository.save(new Consent("C6", "P001", "doctor-null-scopes",
+                Set.of(Purpose.TREATMENT), null, NOW.plus(30, ChronoUnit.DAYS), null));
+
+        GatewayResponse response = accessAndLog("doctor-null-scopes", "P001", Purpose.TREATMENT);
+
+        assertEquals(Decision.ALLOWED, response.decision());
+        assertFalse(String.valueOf(response.data()).contains(ScopeFilter.UNAUTHORIZED));
+    }
+
+    @Test
+    void explicitEmptyScopesIsStillDeniedNoScope() {
+        // 确实列了维度但为空集：走部分可见判定 -> 零维度整体拒绝（与旧授权明确区分）
+        consentRepository.save(new Consent("C7", "P001", "analyst-empty",
+                Set.of(Purpose.RESEARCH), Set.of(), NOW.plus(30, ChronoUnit.DAYS), null));
+
+        GatewayResponse response = accessAndLog("analyst-empty", "P001", Purpose.RESEARCH);
+
+        assertEquals(Decision.DENIED_NO_SCOPE, response.decision());
+        assertNull(response.data());
+    }
+
+    @Test
+    void legacyConsentSnapshotRoundTripsThroughAudit() {
+        // 旧授权的快照必须能区分「未写维度」，重放时还原出的判定输入与当时一致
+        Consent legacy = new Consent("C8", "P001", "doctor-snap",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null);
+        Consent explicitEmpty = new Consent("C9", "P001", "analyst-snap",
+                Set.of(Purpose.RESEARCH), Set.of(), NOW.plus(30, ChronoUnit.DAYS), null);
+        log.info("输入: 旧授权快照={}, 空维度授权快照={}", legacy.toSnapshot(), explicitEmpty.toSnapshot());
+
+        Consent restoredLegacy = Consent.fromSnapshot(legacy.toSnapshot());
+        Consent restoredEmpty = Consent.fromSnapshot(explicitEmpty.toSnapshot());
+        log.info("判定依据: 还原后 legacy.hasScopeRestriction={}, empty.hasScopeRestriction={}",
+                restoredLegacy.hasScopeRestriction(), restoredEmpty.hasScopeRestriction());
+
+        assertFalse(restoredLegacy.hasScopeRestriction(), "旧授权快照还原后仍应是全量访问");
+        assertTrue(restoredEmpty.hasScopeRestriction(), "空维度授权快照还原后仍应走部分可见判定");
+        assertTrue(restoredEmpty.getScopes().isEmpty());
+    }
+
     private static void assertNotEqualsAlloweds(String decision) {
         assertFalse(decision.equals("ALLOWED") || decision.equals("ALLOWED_PARTIAL"),
                 "应当与部分可见区分: " + decision);

@@ -35,7 +35,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -63,7 +65,7 @@ class ReplayServiceTest {
         maskingService = new MaskingService(new MockEnvironment());
         auditLog = new AuditLog();
         recordStore = new PatientRecordStore();
-        replayService = new ReplayService(auditLog, ruleRegistry, maskingService);
+        replayService = new ReplayService(auditLog, ruleRegistry, maskingService, recordStore);
     }
 
     private PatientDataGateway gatewayAt(String ruleVersion) {
@@ -75,10 +77,10 @@ class ReplayServiceTest {
     private void logReplay(long sequence, ReplayResult result) {
         log.info("输入: replay(sequence={})", sequence);
         log.info("判定依据: 记录[decision={}, ruleVersion={}, maskingPolicyVersion={}], "
-                        + "重放[decision={}, consistent={}]",
+                        + "重放[decision={}, payloadMatches={}, consistent={}]",
                 result.record().decision(), result.record().ruleVersion(),
                 result.record().maskingPolicyVersion(),
-                result.replayedDecision(), result.consistent());
+                result.replayedDecision(), result.payloadMatches(), result.consistent());
     }
 
     @Test
@@ -178,6 +180,71 @@ class ReplayServiceTest {
         logReplay(seq, replay);
         assertTrue(replay.consistent());
         assertEquals("DENIED_NO_CONSENT", replay.replayedDecision());
+    }
+
+    @Test
+    void replayRecomputesMaskedPayloadWithHistoricalPolicyVersion() {
+        consentRepository.save(new Consent("C5", "P001", "doctor-A",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null));
+        GatewayResponse response = gatewayAt("consent-rules-v1")
+                .access(new AccessRequest("doctor-A", "P001", Purpose.TREATMENT));
+        long seq = auditLog.records().size() - 1;
+        String recordedPayload = auditLog.recordAt(seq).maskedPayload();
+
+        // 发布新策略版本：name 从 PARTIAL 改成 FULL。重放必须仍按 masking-v1 重算
+        maskingService.publishPolicy(new MaskingPolicy("masking-v2",
+                Map.of("name", MaskingPolicy.Strategy.FULL)));
+        log.info("输入: masking-v1 下访问产生记录 seq={}, 随后发布 masking-v2(name=FULL)", seq);
+
+        ReplayResult replay = replayService.replay(seq);
+        logReplay(seq, replay);
+        log.info("重放重算的脱敏结果: {}", replay.maskedPayload());
+
+        assertTrue(replay.consistent());
+        assertTrue(replay.payloadMatches());
+        // 重放返回的脱敏结果是按 masking-v1 重新算出来的：name 是 PARTIAL 形态「张*」，
+        // 不是 masking-v2 的 FULL 形态，也不是简单把记录留存值原样返回（见下一条用例）
+        assertTrue(replay.maskedPayload().contains("张*"),
+                "应按当时策略重算: " + replay.maskedPayload());
+        assertEquals(recordedPayload, replay.maskedPayload());
+        assertEquals(CanonicalPayload.of(response.data()), replay.maskedPayload());
+    }
+
+    @Test
+    void replayDetectsMismatchWhenPayloadCannotBeReproduced() {
+        consentRepository.save(new Consent("C6", "P001", "doctor-A",
+                Set.of(Purpose.TREATMENT), NOW.plus(30, ChronoUnit.DAYS), null));
+        gatewayAt("consent-rules-v1")
+                .access(new AccessRequest("doctor-A", "P001", Purpose.TREATMENT));
+        long seq = auditLog.records().size() - 1;
+
+        // 访问后患者数据被更新：按当时策略重算出的脱敏结果与记录留存内容对不上，
+        // 重放必须明确标出不一致，而不是把记录里的留存内容原样当结果返回
+        Map<String, Object> changed = new java.util.HashMap<>(recordStore.findById("P001").orElseThrow());
+        changed.put("phone", "13900000000");
+        recordStore.save("P001", changed);
+        log.info("输入: 记录 seq={} 产生后, P001 的 phone 被更新, 再重放", seq);
+
+        ReplayResult replay = replayService.replay(seq);
+        logReplay(seq, replay);
+
+        assertFalse(replay.payloadMatches(), "数据变化后重算结果应与记录对不上");
+        assertFalse(replay.consistent());
+        // 判定结论部分仍然可复现（授权快照不变）
+        assertEquals("ALLOWED", replay.replayedDecision());
+    }
+
+    @Test
+    void deniedRecordHasNullPayloadAndReplaysConsistently() {
+        gatewayAt("consent-rules-v2")
+                .access(new AccessRequest("stranger", "P001", Purpose.TREATMENT));
+        long seq = auditLog.records().size() - 1;
+
+        ReplayResult replay = replayService.replay(seq);
+        logReplay(seq, replay);
+        assertTrue(replay.consistent());
+        assertTrue(replay.payloadMatches());
+        assertNull(replay.maskedPayload(), "拒绝记录没有返回内容");
     }
 
     @Test
